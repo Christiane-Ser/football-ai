@@ -15,19 +15,32 @@ app.use(express.json());
 
 connectDB();
 
+const runPython = (scriptArgs, cwd, stdio = "inherit") => {
+  const candidates = [
+    { command: "python", args: scriptArgs },
+    { command: "py", args: ["-3", ...scriptArgs] },
+    { command: "python3", args: scriptArgs },
+  ];
+
+  for (const candidate of candidates) {
+    const result = spawnSync(candidate.command, candidate.args, { cwd, stdio });
+    if (!result.error && result.status === 0) {
+      return true;
+    }
+  }
+
+  return false;
+};
+
 const ensureStatsbombCsv = () => {
-  const csvPath = path.join(__dirname, "..", "..", "ai", "data", "matches.csv");
+  const csvPath = path.join(__dirname, "..", "ai", "data", "matches.csv");
   if (fs.existsSync(csvPath)) {
     return csvPath;
   }
 
   try {
-    const aiDir = path.join(__dirname, "..", "..", "ai");
-    const result = spawnSync("python", ["ingest_statsbomb.py"], {
-      cwd: aiDir,
-      stdio: "inherit",
-    });
-    if (result.status === 0 && fs.existsSync(csvPath)) {
+    const aiDir = path.join(__dirname, "..", "ai");
+    if (runPython(["ingest_statsbomb.py"], aiDir) && fs.existsSync(csvPath)) {
       return csvPath;
     }
   } catch (error) {
@@ -37,33 +50,66 @@ const ensureStatsbombCsv = () => {
   return null;
 };
 
+const parseMatchesCsv = (csvText) => {
+  const lines = csvText.split("\n").filter(Boolean);
+  if (lines.length <= 1) return [];
+
+  const headers = lines[0].split(",").map((h) => h.trim());
+  const idx = Object.fromEntries(headers.map((h, i) => [h, i]));
+
+  const read = (row, key, fallback = "") => row[idx[key]] ?? fallback;
+  const readNum = (row, key) => {
+    const value = Number(read(row, key, 0));
+    return Number.isFinite(value) ? value : 0;
+  };
+
+  return lines.slice(1).map((line) => {
+    const row = line.split(",");
+    return {
+      teamA: read(row, "team_a", "Unknown A"),
+      teamB: read(row, "team_b", "Unknown B"),
+      scoreA: Math.max(0, Math.round(readNum(row, "goals_a"))),
+      scoreB: Math.max(0, Math.round(readNum(row, "goals_b"))),
+      date: read(row, "date", ""),
+    };
+  });
+};
+
+const isOutlierScore = (match) =>
+  (Number(match.scoreA) || 0) > 15 || (Number(match.scoreB) || 0) > 15;
+
+const hasUnrealisticData = async () => {
+  const sample = await Match.find().limit(200);
+  if (!sample.length) return false;
+  const outliers = sample.filter(isOutlierScore).length;
+  return outliers / sample.length >= 0.05;
+};
+
 const seedMatches = async () => {
   if (Match.db?.readyState !== 1) {
-    return;
+    return false;
   }
 
   const count = await Match.countDocuments();
   if (count > 0) {
-    return;
+    // Auto-heal legacy bad seed where scores were read from possession columns.
+    const unrealistic = await hasUnrealisticData();
+    if (!unrealistic) {
+      return true;
+    }
+    console.warn("Detected unrealistic match scores. Rebuilding matches collection.");
+    await Match.deleteMany({});
   }
 
   try {
     const statsbombPath = ensureStatsbombCsv();
     if (statsbombPath && fs.existsSync(statsbombPath)) {
       const csv = fs.readFileSync(statsbombPath, "utf-8");
-      const lines = csv.split("\n").filter(Boolean);
-      const rows = lines.slice(1).map((line) => line.split(","));
-      const data = rows.map((r) => ({
-        teamA: r[1],
-        teamB: r[2],
-        scoreA: Number(r[14]) || 0,
-        scoreB: Number(r[15]) || 0,
-        date: r[0],
-      }));
+      const data = parseMatchesCsv(csv);
       if (data.length) {
         await Match.insertMany(data);
         console.log(`Seeded ${data.length} matches from StatsBomb CSV.`);
-        return;
+        return true;
       }
     }
 
@@ -77,9 +123,18 @@ const seedMatches = async () => {
   } catch (error) {
     console.warn("Seed failed", error.message);
   }
+
+  return true;
 };
 
-setTimeout(seedMatches, 1000);
+let seedAttempts = 0;
+const seedTimer = setInterval(async () => {
+  seedAttempts += 1;
+  const done = await seedMatches();
+  if (done || seedAttempts >= 20) {
+    clearInterval(seedTimer);
+  }
+}, 1500);
 
 app.use("/api", require("./routes/predict.routes"));
 app.use("/api/test", require("./routes/test.routes"));
